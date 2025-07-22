@@ -13,7 +13,7 @@ __pycache__/
 pixi.lock
 # C extensions
 *.so
-
+.snakemake/
 # Distribution / packaging
 .Python
 build/
