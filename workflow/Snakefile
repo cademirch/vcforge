@@ -1,0 +1,170 @@
+import random
+from pathlib import Path
+
+NUM_SAMPLES_PER_POP = 5
+SAMPLE_NAMES = [f"Pop1_sample_{i}" for i in range(NUM_SAMPLES_PER_POP)] + [
+    f"Pop2_sample_{i}" for i in range(NUM_SAMPLES_PER_POP)
+]
+random.seed(42)
+SAMPLE_SEEDS = {sample: random.randint(1, int(1e6)) for sample in SAMPLE_NAMES}
+
+
+rule all:
+    input:
+        #expand("mapped/{sample}.bam", sample=SAMPLE_NAMES),
+        "calls/varsonly.vcf",
+        "calls/allsites.vcf"
+        # ref=Path(workflow.basedir, "resources/chr2L_1-2mb.dict"),
+
+rule create_dict:
+    input:
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+    output:
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.dict"),
+    log:
+        "logs/picard/create_dict.log",
+    params:
+        extra="",  # optional: extra arguments for picard.
+    # optional specification of memory usage of the JVM that snakemake will respect with global
+    # resource restrictions (https://snakemake.readthedocs.io/en/latest/snakefiles/rules.html#resources)
+    # and which can be used to request RAM during cluster job submission as `{resources.mem_mb}`:
+    # https://snakemake.readthedocs.io/en/latest/executing/cluster.html#job-properties
+    resources:
+        mem_mb=1024,
+    wrapper:
+        "v7.2.0/bio/picard/createsequencedictionary"
+rule simulate_haplotypes:
+    input:
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+    output:
+        fastas=expand("sim/alignments/{sample}.fasta", sample=SAMPLE_NAMES),
+    params:
+        outdir="sim",
+        num_samples=NUM_SAMPLES_PER_POP,
+    script:
+        "scripts/sim_haplotypes.py"
+
+
+rule simulate_reads:
+    input:
+        fasta="sim/alignments/{sample}.fasta",
+    output:
+        fq1="reads/{sample}_1.fq",
+        fq2="reads/{sample}_2.fq",
+    params:
+        prefix="reads/{sample}_",
+        seed=lambda wildcards: SAMPLE_SEEDS[wildcards.sample],
+        read_length=150,
+        insert_size=350,
+        sd_insert=50,
+        fold_coverage=10,
+        art_model="HS25",
+    log:
+        "logs/sim_reads/{sample}.log",
+    threads: 1
+    shell:
+        """
+        art_illumina \
+            -ss {params.art_model} \
+            -i {input.fasta} \
+            -p \
+            -l {params.read_length} \
+            -f {params.fold_coverage} \
+            -m {params.insert_size} \
+            -s {params.sd_insert} \
+            -rs {params.seed} \
+            -o {params.prefix} &> {log}
+        """
+
+
+rule bwa_mem:
+    input:
+        reads=["reads/{sample}_1.fq", "reads/{sample}_2.fq"],
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+    output:
+        bam = "mapped/{sample}.bam",
+        bai = "mapped/{sample}.bam.bai",
+    log:
+        "logs/bwa_mem/{sample}.log",
+    params:
+        extra=r"-R '@RG\tID:{sample}\tSM:{sample}'",
+    shell:
+        """
+        bwa mem {params.extra} {input.ref} {input.reads} 2> {log} | samtools sort > {output.bam} -
+        samtools index {output.bam}
+        """
+
+
+rule haplotype_caller_gvcf:
+    input:
+        # single or list of bam files
+        bam="mapped/{sample}.bam",
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        bam_index = "mapped/{sample}.bam.bai",
+        # known="dbsnp.vcf"  # optional
+    output:
+        gvcf="calls/{sample}.g.vcf.gz",
+    #       bam="{sample}.assemb_haplo.bam",
+    log:
+        "logs/gatk/haplotypecaller/{sample}.log",
+    params:
+        extra="",  # optional
+        java_opts="",  # optional
+    threads: 4
+    resources:
+        mem_mb=1024,
+    wrapper:
+        "v7.2.0/bio/gatk/haplotypecaller"
+
+rule genomics_db_import:
+    input:
+        gvcfs=expand("calls/{sample}.g.vcf.gz", sample=SAMPLE_NAMES),
+    output:
+        db=directory("calls/db"),
+    log:
+        "logs/gatk/genomicsdbimport.log",
+    params:
+        intervals="NT_033779.5:1000000-2000000",
+        db_action="create",  # optional
+        extra="",  # optional
+        java_opts="",  # optional
+    threads: 2
+    resources:
+        mem_mb=lambda wildcards, input: max([input.size_mb * 1.6, 200]),
+    wrapper:
+        "v7.2.0/bio/gatk/genomicsdbimport"
+
+rule genotype_gvcfs:
+    input:
+        genomicsdb="calls/db",  # combined gvcf over multiple samples
+    # N.B. gvcf or genomicsdb must be specified
+    # in the latter case, this is a GenomicsDB data store
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+    output:
+        vcf="calls/varsonly.vcf",
+    log:
+        "logs/gatk/genotypegvcfs_vars.log"
+    params:
+        extra="",  # optional
+        java_opts="", # optional
+    resources:
+        mem_mb=1024
+    wrapper:
+        "v7.2.0/bio/gatk/genotypegvcfs"
+
+rule genotype_gvcfs_allsites:
+    input:
+        genomicsdb="calls/db",  # combined gvcf over multiple samples
+        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+    output:
+        vcf="calls/allsites.vcf",
+    log:
+        "logs/gatk/genotypegvcfs_allsites.log"
+    params:
+        extra="-all-sites",  # optional
+        java_opts="", # optional
+    resources:
+        mem_mb=1024
+    wrapper:
+        "v7.2.0/bio/gatk/genotypegvcfs"
+
