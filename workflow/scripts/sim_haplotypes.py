@@ -9,6 +9,7 @@ import msprime
 import argparse
 import pandas as pd
 import os
+import numpy as np
 import pyfastx
 from loguru import logger
 from snakemake_argparse_bridge import snakemake_compatible
@@ -26,7 +27,7 @@ def read_fasta(fasta: str) -> str:
     
     raise ValueError(f"No sequences found in {fasta}")
 
-@snakemake_compatible({"outdir":"params.outdir", "samples_per_pop":"params.num_samples", "reference_fasta":"input.ref"})
+@snakemake_compatible({"outdir":"params.outdir", "samples_per_pop":"params.num_samples", "reference_fasta":"input.ref", "seed":"params.seed"})
 def main():
     parser = argparse.ArgumentParser(description="Simple 2-population simulation")
     
@@ -39,7 +40,9 @@ def main():
     parser.add_argument(
         "--ref", dest="reference_fasta", help="path to ref fasta"
     )
-    
+
+    parser.add_argument("--seed", dest="seed", help="random seed")
+
     args = parser.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     logger.add(os.path.join(args.outdir, "log.txt"))
@@ -49,49 +52,34 @@ def main():
     reference_seq = read_fasta(args.reference_fasta)
     logger.info(f"Read fasta: {args.reference_fasta}, found {len(reference_seq)}nt")
 
-    demography = msprime.Demography()
+    Ne1 = 1e6
 
-    Ne1 = 10000  
-    Ne2 = 10000  
-    T_split = 2000  
-    migration_rate = 1e-5 
-
-    demography.add_population(name="Pop1", initial_size=Ne1)
-    demography.add_population(name="Pop2", initial_size=Ne2)
-    demography.add_population(name="Ancestral", initial_size=15000)
-    demography.add_population_split(
-        time=T_split, derived=["Pop1", "Pop2"], ancestral="Ancestral"
-    )
-
-    demography.add_migration_rate_change(
-        time=0, rate=migration_rate, source="Pop1", dest="Pop2"
-    )
-    demography.add_migration_rate_change(
-        time=0, rate=migration_rate, source="Pop2", dest="Pop1"
-    )
-    demography.sort_events()
-    logger.info(
-        f"Demographic model: Ne1={Ne1}, Ne2={Ne2}, T_split={T_split}, migration={migration_rate}"
-    )
-
+    total_samples = args.samples_per_pop * 2
     logger.info("Simulating ancestry...")
+
     ts = msprime.sim_ancestry(
-        samples={"Pop1": args.samples_per_pop, "Pop2": args.samples_per_pop},
-        demography=demography,
+        samples=total_samples,  # 20 haploid samples is s=5
+        population_size=Ne1,
         sequence_length=len(reference_seq),
         recombination_rate=contig.recombination_map.mean_rate,
+        random_seed=args.seed,
     )
 
     logger.info("Adding mutations...")
     mutation_rate = species.genome.mean_mutation_rate
-    ts = msprime.sim_mutations(ts, rate=mutation_rate)
+    ts = msprime.sim_mutations(ts, rate=mutation_rate, random_seed=args.seed)
 
     logger.info(f"Generated {ts.num_sites} variant sites")
+    logger.info(f"Number of samples: {ts.num_samples}")
+    logger.info(f"Number of populations: {ts.num_populations}")
 
     logger.info("Calculating true statistics...")
 
-    pop1_samples = list(range(args.samples_per_pop))
-    pop2_samples = list(range(args.samples_per_pop, 2 * args.samples_per_pop))
+    # Pop1: first args.samples_per_pop * 2 haplotypes (0 to 9 if samples_per_pop=5)
+    # Pop2: next args.samples_per_pop * 2 haplotypes (10 to 19 if samples_per_pop=5)
+
+    pop1_samples = list(range(args.samples_per_pop * 2))
+    pop2_samples = list(range(args.samples_per_pop * 2, args.samples_per_pop * 4))
 
     pi_pop1 = ts.diversity(sample_sets=[pop1_samples])
     pi_pop2 = ts.diversity(sample_sets=[pop2_samples])
@@ -113,6 +101,15 @@ def main():
     logger.info(f"dxy:        {dxy:.6f}")
     logger.info(f"Fst:        {fst:.6f}")
 
+    expected_pi = 4 * Ne1 * mutation_rate
+    expected_dxy = 4 * Ne1 * mutation_rate
+    expected_fst = (expected_dxy - expected_pi) / expected_dxy
+
+    logger.info("\n=== EXPECTED VALUES ===")
+    logger.info(f"π Expected:   {expected_pi:.6f}")
+    logger.info(f"dXY Expected: {expected_dxy:.6f}")
+    logger.info(f"FST Expected: {expected_fst:.6f}")
+
     truth_df = pd.DataFrame(
         [
             {
@@ -123,22 +120,19 @@ def main():
                 "fst": fst,
                 "mutation_rate": mutation_rate,
                 "Ne1": Ne1,
-                "Ne2": Ne2,
-                "T_split": T_split,
-                "migration_rate": migration_rate,
+                "expected_pi": expected_pi,
+                "expected_dxy": expected_dxy,
+                "expected_fst": expected_fst,
             }
         ]
     )
-    
+
     truth_df.to_csv(os.path.join(args.outdir, "truth.csv"), index=False)
     logger.info(f"\nSaved truth values: {os.path.join(args.outdir, 'truth.csv')}")
-
-    
 
     sample_names = [f"Pop1_sample_{i}" for i in range(args.samples_per_pop)] + [
         f"Pop2_sample_{i}" for i in range(args.samples_per_pop)
     ]
-
 
     ts.dump(os.path.join(args.outdir, "sim.trees"))
     logger.info(f"Saved tree sequence: {os.path.join(args.outdir, 'sim.trees')}")
@@ -150,32 +144,64 @@ def main():
             + ["Pop2"] * args.samples_per_pop,
         }
     )
-    pop_map.to_csv(os.path.join(args.outdir, "popmap.txt"), sep="\t", index=False)
+    pop_map.to_csv(
+        os.path.join(args.outdir, "popmap.txt"), sep="\t", index=False, header=False
+    )
     logger.info(f"Saved population map: {os.path.join(args.outdir, 'popmap.txt')}")
 
-    
-    
     logger.info("Writing sample alignments...")
     os.makedirs(os.path.join(args.outdir, "alignments"), exist_ok=True)
     alignments = list(ts.alignments(reference_sequence=reference_seq))
     logger.info(f"{len(alignments)=}")
+
+    # alignments 0-9: Pop1 (individuals 0-4, haplotypes 0-9)
+    # alignments 10-19: Pop2 (individuals 0-4, haplotypes 10-19)
+
     for i in range(0, len(alignments), 2):
-        individual_id = i // 2
+        haplotype_pair_id = i // 2  # 0,1,2,3,4,5,6,7,8,9
         hap1, hap2 = alignments[i], alignments[i + 1]
-        
-        if individual_id < args.samples_per_pop:
-            sample_name = f"Pop1_sample_{individual_id}"
+
+        if haplotype_pair_id < args.samples_per_pop:
+            # First args.samples_per_pop individuals belong to Pop1
+            sample_name = f"Pop1_sample_{haplotype_pair_id}"
         else:
-            sample_name = f"Pop2_sample_{individual_id - args.samples_per_pop}"
-        
-        with open(os.path.join(args.outdir, "alignments", f"{sample_name}.fasta"), "w") as f:
+            # Next args.samples_per_pop individuals belong to Pop2
+            sample_name = f"Pop2_sample_{haplotype_pair_id - args.samples_per_pop}"
+
+        # Write haplotype 0
+        with open(
+            os.path.join(args.outdir, "alignments", f"{sample_name}.fasta"), "w"
+        ) as f:
             f.write(f">{sample_name}_hap0\n")
             f.write(hap1 + "\n")
+
+            # Write haplotype 1
             f.write(f">{sample_name}_hap1\n")
             f.write(hap2 + "\n")
-    
-    logger.info(f"Saved {len(sample_names)} alignment files to {os.path.join(args.outdir, 'alignments')}")
 
+    tables = ts.dump_tables()
+
+    # Track existing variant positions
+    existing_pos = np.round(ts.tables.sites.position).astype(int)
+    existing_pos_set = set(existing_pos)
+
+    # Add sites for invariant positions
+    for pos in range(int(ts.sequence_length)):
+        if pos not in existing_pos_set:
+            # Optional: derive ancestral state from reference
+            tables.sites.add_row(
+                position=pos, ancestral_state="."
+            )  # or use "." if you don't care
+
+    # Re-sort and convert back to tree sequence
+    tables.sort()
+    ts_all = tables.tree_sequence()
+    with open(os.path.join(args.outdir, "perfect.vcf"), "w") as f:
+        ts_all.write_vcf(
+            f,
+            position_transform=lambda x: 1 + np.round(x),
+            individual_names=sample_names,
+        )
 
 if __name__ == "__main__":
     main()

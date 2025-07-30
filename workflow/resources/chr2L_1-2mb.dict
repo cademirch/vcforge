@@ -1,2 +1,2 @@
 @HD	VN:1.6
-@SQ	SN:NT_033779.5:1000000-2000000	LN:1000001	M5:12ff97706d27d0bccc9602b70809189a	UR:file:///Users/cade/dev/clam_ms_revisions/simulations/workflow/resources/chr2L_1-2mb.fa
+@SQ	SN:chr2l	LN:1000001	M5:12ff97706d27d0bccc9602b70809189a	UR:file:///scratch2/cade/clam-revisions/vcforge/workflow/resources/chr2L_1-2mb.fa

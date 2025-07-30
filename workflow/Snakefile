@@ -2,65 +2,84 @@ import random
 from pathlib import Path
 
 NUM_SAMPLES_PER_POP = 5
+REP_IDS = list(range(10))
+TARGET_COVERAGE = config.get("target_cov", 30) // 2 # divide by 2 cuz art simulates this value for each haplotype in the fasta
+
 SAMPLE_NAMES = [f"Pop1_sample_{i}" for i in range(NUM_SAMPLES_PER_POP)] + [
     f"Pop2_sample_{i}" for i in range(NUM_SAMPLES_PER_POP)
 ]
+
 random.seed(42)
 SAMPLE_SEEDS = {sample: random.randint(1, int(1e6)) for sample in SAMPLE_NAMES}
-
+REP_SEEDS = {rep: random.randint(1, int(1e6)) for rep in REP_IDS}
 
 rule all:
     input:
-        #expand("mapped/{sample}.bam", sample=SAMPLE_NAMES),
-        "calls/varsonly.vcf",
-        "calls/allsites.vcf"
-        # ref=Path(workflow.basedir, "resources/chr2L_1-2mb.dict"),
+        # expand("{rep}/results.csv",rep=REP_IDS),
+        expand("{rep}/clam/prop_callable.tsv",rep=REP_IDS),
+        expand("{rep}/calls/allsites.prop_callable.tsv",rep=REP_IDS),
+        # vcfgz=expand("{rep}/calls/{vcftype}.vcf.gz", rep=REP_IDS, vcftype=["allsites", "perfect", "varsonly"]),
+        # vcftbi=expand("{rep}/calls/{vcftype}.vcf.gz.tbi", rep=REP_IDS, vcftype=["allsites", "perfect", "varsonly"]),
+    
+
+rule build_clam:
+    output:
+        binary=Path(workflow.basedir, "bin/clam/target/release/clam"),
+    params:
+        outdir=Path(workflow.basedir, "bin")
+    shell:
+        """
+        if [ -d {params.outdir}/clam ]; then rm -rf {params.outdir}/clam; fi
+        git clone https://github.com/cademirch/clam.git {params.outdir}/clam
+        cd {params.outdir}/clam
+        cargo build --release
+        chmod +x {output.binary}
+        """
 
 rule create_dict:
     input:
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
     output:
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.dict"),
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.dict"),
     log:
         "logs/picard/create_dict.log",
-    params:
-        extra="",  # optional: extra arguments for picard.
-    # optional specification of memory usage of the JVM that snakemake will respect with global
-    # resource restrictions (https://snakemake.readthedocs.io/en/latest/snakefiles/rules.html#resources)
-    # and which can be used to request RAM during cluster job submission as `{resources.mem_mb}`:
-    # https://snakemake.readthedocs.io/en/latest/executing/cluster.html#job-properties
     resources:
         mem_mb=1024,
     wrapper:
         "v7.2.0/bio/picard/createsequencedictionary"
+
+
 rule simulate_haplotypes:
     input:
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
     output:
-        fastas=expand("sim/alignments/{sample}.fasta", sample=SAMPLE_NAMES),
+        fastas=expand("{{rep}}/sim/alignments/{sample}.fasta", sample=SAMPLE_NAMES),
+        popmap="{rep}/sim/popmap.txt",
+        vcf="{rep}/sim/perfect.vcf",
     params:
-        outdir="sim",
+        outdir="{rep}/sim",
         num_samples=NUM_SAMPLES_PER_POP,
+        seed=lambda wildcards: REP_SEEDS[int(wildcards.rep)]
     script:
         "scripts/sim_haplotypes.py"
 
 
 rule simulate_reads:
     input:
-        fasta="sim/alignments/{sample}.fasta",
+        fasta="{rep}/sim/alignments/{sample}.fasta",
     output:
-        fq1="reads/{sample}_1.fq",
-        fq2="reads/{sample}_2.fq",
+        fq1="{rep}/reads/{sample}_1.fq",
+        fq2="{rep}/reads/{sample}_2.fq",
     params:
-        prefix="reads/{sample}_",
-        seed=lambda wildcards: SAMPLE_SEEDS[wildcards.sample],
+        prefix="{rep}/reads/{sample}_",
+        seed=lambda wildcards: SAMPLE_SEEDS[wildcards.sample] + int(wildcards.rep),
         read_length=150,
         insert_size=350,
         sd_insert=50,
-        fold_coverage=10,
+        fold_coverage=TARGET_COVERAGE,
         art_model="HS25",
     log:
-        "logs/sim_reads/{sample}.log",
+        "{rep}/logs/sim_reads/{sample}.log",
     threads: 1
     shell:
         """
@@ -79,13 +98,13 @@ rule simulate_reads:
 
 rule bwa_mem:
     input:
-        reads=["reads/{sample}_1.fq", "reads/{sample}_2.fq"],
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        reads=["{rep}/reads/{sample}_1.fq", "{rep}/reads/{sample}_2.fq"],
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
     output:
-        bam = "mapped/{sample}.bam",
-        bai = "mapped/{sample}.bam.bai",
+        bam="{rep}/mapped/{sample}.bam",
+        bai="{rep}/mapped/{sample}.bam.bai",
     log:
-        "logs/bwa_mem/{sample}.log",
+        "{rep}/logs/bwa_mem/{sample}.log",
     params:
         extra=r"-R '@RG\tID:{sample}\tSM:{sample}'",
     shell:
@@ -95,76 +114,298 @@ rule bwa_mem:
         """
 
 
+rule mosdepth:
+    input:
+        bam="{rep}/mapped/{sample}.bam",
+        bai="{rep}/mapped/{sample}.bam.bai",
+    output:
+        d4="{rep}/depth/{sample}.per-base.d4",
+    params:
+        prefix=subpath(output.d4, strip_suffix=".per-base.d4"),
+        mapq=f"-Q 0",
+    conda:
+        "envs/d4.yaml"
+    shell:
+        """
+        mosdepth -t {threads} {params.mapq} --d4 {params.prefix} {input.bam}
+        """
+
+
+rule bgzip_d4:
+    input:
+        d4="{rep}/depth/{sample}.per-base.d4",
+    output:
+        d4gz="{rep}/depth/{sample}.per-base.d4.gz",
+        d4gzi="{rep}/depth/{sample}.per-base.d4.gz.gzi",
+    shell:
+        """
+        bgzip --binary -i {input.d4}
+        """
+
+
 rule haplotype_caller_gvcf:
     input:
-        # single or list of bam files
-        bam="mapped/{sample}.bam",
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
-        bam_index = "mapped/{sample}.bam.bai",
-        # known="dbsnp.vcf"  # optional
+        bam="{rep}/mapped/{sample}.bam",
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
+        bam_index="{rep}/mapped/{sample}.bam.bai",
+        ref_dict=Path(workflow.basedir, "resources/chr2l_100kb.dict"),
     output:
-        gvcf="calls/{sample}.g.vcf.gz",
-    #       bam="{sample}.assemb_haplo.bam",
+        gvcf="{rep}/calls/{sample}.g.vcf.gz",
     log:
-        "logs/gatk/haplotypecaller/{sample}.log",
+        "{rep}/logs/gatk/haplotypecaller/{sample}.log",
     params:
-        extra="",  # optional
-        java_opts="",  # optional
-    threads: 4
+        extra="",
+        java_opts="",
+    threads: 1
     resources:
         mem_mb=1024,
     wrapper:
         "v7.2.0/bio/gatk/haplotypecaller"
 
+
 rule genomics_db_import:
     input:
-        gvcfs=expand("calls/{sample}.g.vcf.gz", sample=SAMPLE_NAMES),
+        gvcfs=expand("{{rep}}/calls/{sample}.g.vcf.gz", sample=SAMPLE_NAMES),
     output:
-        db=directory("calls/db"),
+        db=directory("{rep}/calls/db"),
     log:
-        "logs/gatk/genomicsdbimport.log",
+        "{rep}/logs/gatk/genomicsdbimport.log",
     params:
-        intervals="NT_033779.5:1000000-2000000",
-        db_action="create",  # optional
-        extra="",  # optional
-        java_opts="",  # optional
+        intervals="chr2l",
+        db_action="create",
+        extra="",
+        java_opts="",
     threads: 2
     resources:
         mem_mb=lambda wildcards, input: max([input.size_mb * 1.6, 200]),
     wrapper:
         "v7.2.0/bio/gatk/genomicsdbimport"
 
+
 rule genotype_gvcfs:
     input:
-        genomicsdb="calls/db",  # combined gvcf over multiple samples
-    # N.B. gvcf or genomicsdb must be specified
-    # in the latter case, this is a GenomicsDB data store
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        genomicsdb="{rep}/calls/db",
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
     output:
-        vcf="calls/varsonly.vcf",
+        vcf="{rep}/calls/varsonly.vcf",
     log:
-        "logs/gatk/genotypegvcfs_vars.log"
+        "{rep}/logs/gatk/genotypegvcfs_vars.log",
     params:
-        extra="",  # optional
-        java_opts="", # optional
+        extra="",
+        java_opts="",
     resources:
-        mem_mb=1024
+        mem_mb=1024,
     wrapper:
         "v7.2.0/bio/gatk/genotypegvcfs"
+
 
 rule genotype_gvcfs_allsites:
     input:
-        genomicsdb="calls/db",  # combined gvcf over multiple samples
-        ref=Path(workflow.basedir, "resources/chr2L_1-2mb.fa"),
+        genomicsdb="{rep}/calls/db",
+        ref=Path(workflow.basedir, "resources/chr2l_100kb.fa"),
     output:
-        vcf="calls/allsites.vcf",
+        vcf="{rep}/calls/allsites.vcf",
     log:
-        "logs/gatk/genotypegvcfs_allsites.log"
+        "{rep}/logs/gatk/genotypegvcfs_allsites.log",
     params:
-        extra="-all-sites",  # optional
-        java_opts="", # optional
+        extra="-all-sites",
+        java_opts="",
     resources:
-        mem_mb=1024
+        mem_mb=1024,
     wrapper:
         "v7.2.0/bio/gatk/genotypegvcfs"
 
+
+def get_vcf(wc):
+    if wc.type == "perfect":
+        return "{rep}/sim/perfect.vcf"
+    else:
+        return "{rep}/calls/{type}.vcf"
+
+
+rule bgzip_vcf:
+    input:
+        vcf=get_vcf,
+    output:
+        vcfgz="{rep}/calls/{type}.vcf.gz",
+        vcftbi="{rep}/calls/{type}.vcf.gz.tbi",
+    params:
+        max_missing=0.9
+    run:
+        if wildcards.type == "perfect":
+            shell(
+                """
+                bcftools view --exclude-types indels --max-alleles 2 {input.vcf} \
+                | bgzip -c > {output.vcfgz}
+            """
+            )
+        else:
+            shell(
+                """
+                bcftools view --exclude-types indels --max-alleles 2 {input.vcf} \
+                | bcftools +setGT -Ov - -- -n . -t q -i 'FORMAT/DP<=10' \
+                | bgzip -c > {output.vcfgz}
+            """
+            )
+        shell("tabix -p vcf {output.vcfgz}")
+
+
+        
+
+
+rule clam_loci:
+    input:
+        binary=Path(workflow.basedir, "bin/clam/target/release/clam"),
+        d4gz=expand("{{rep}}/depth/{sample}.per-base.d4.gz", sample=SAMPLE_NAMES),
+        d4gzi=expand("{{rep}}/depth/{sample}.per-base.d4.gz.gzi", sample=SAMPLE_NAMES),
+        popmap="{rep}/sim/popmap.txt",
+    output:
+        "{rep}/clam/callable_sites.d4",
+    params:
+        outdir="{rep}/clam",
+        min_depth=10,
+    conda:
+        "envs/clam.yaml"
+    shell:
+        """
+        {input.binary} loci -m {params.min_depth} -p {input.popmap} --bed -o {params.outdir} {input.d4gz}
+        """
+
+
+rule clam:
+    input:
+        binary=Path(workflow.basedir, "bin/clam/target/release/clam"),
+        vcf="{rep}/calls/{type}.vcf.gz",
+        popmap="{rep}/sim/popmap.txt",
+        loci="{rep}/clam/callable_sites.d4",
+    output:
+        "{rep}/clam/{type}/clam_pi.tsv",
+        "{rep}/clam/{type}/clam_dxy.tsv",
+        "{rep}/clam/{type}/clam_fst.tsv",
+    conda:
+        "envs/clam.yaml"
+    run:
+        if wildcards.type == "varsonly":
+            shell(
+                "{input.binary} stat -w 1000001 -o {wildcards.rep}/clam/{wildcards.type} -p {input.popmap} {input.vcf} {input.loci}"
+            )
+        else:
+            shell(
+                "{input.binary} stat -w 1000001 -o {wildcards.rep}/clam/{wildcards.type} -p {input.popmap} {input.vcf}"
+            )
+
+
+rule pixy:
+    input:
+        vcf="{rep}/calls/{type}.vcf.gz",
+        popmap="{rep}/sim/popmap.txt",
+    output:
+        "{rep}/pixy/{type}/pixy_pi.txt",
+        "{rep}/pixy/{type}/pixy_dxy.txt",
+        "{rep}/pixy/{type}/pixy_fst.txt",
+    conda:
+        "envs/pixy.yaml"
+    shell:
+        "pixy --stat pi dxy fst --window_size 1000001 --output_folder {wildcards.rep}/pixy/{wildcards.type} --populations {input.popmap} --vcf {input.vcf} --fst_type hudson"
+
+
+rule aggregate:
+    priority: 100
+    input:
+        clam_files=expand(
+            "{{rep}}/clam/{vcftype}/clam_{stat}.tsv",
+            vcftype=["allsites", "perfect", "varsonly"],
+            stat=["pi", "dxy", "fst"],
+        ),
+        pixy_files=expand(
+            "{{rep}}/pixy/{vcftype}/pixy_{stat}.txt",
+            vcftype=["allsites", "perfect"],
+            stat=["pi", "dxy", "fst"],
+        ),
+    output:
+        csv="{rep}/results.csv"
+    run:
+        import pandas as pd
+        from pathlib import Path
+
+        records = []
+
+        def get_value_column(stat, df):
+
+            if stat == "pi":
+                for col in ["pi", "avg_pi"]:
+                    if col in df.columns:
+                        return df[col]
+            if stat == "dxy":
+                for col in ["dxy", "avg_dxy"]:
+                    if col in df.columns:
+                        return df[col]
+            if stat == "fst":
+                for col in ["fst", "avg_hudson_fst"]:
+                    if col in df.columns:
+                        return df[col]
+            return pd.Series([None]*len(df))
+
+        
+        for f in input.clam_files:
+            vcftype = Path(f).parent.name
+            stat = Path(f).stem.split("_")[1]
+            tool = "clam"
+            try:
+                df = pd.read_csv(f, sep="\t")
+                values = get_value_column(stat, df)
+                for v in values:
+                    records.append({"tool": tool, "vcftype": vcftype, "stat": stat, "value": v})
+            except Exception as e:
+                print(f"Skipping {f}: {e}")
+
+        
+        for f in input.pixy_files:
+            vcftype = Path(f).parent.name
+            stat = Path(f).stem.split("_")[1]
+            tool = "pixy"
+            try:
+                df = pd.read_csv(f, sep="\t")
+                values = get_value_column(stat, df)
+                for v in values:
+                    records.append({"tool": tool, "vcftype": vcftype, "stat": stat, "value": v})
+            except Exception as e:
+                print(f"Skipping {f}: {e}")
+        df = pd.DataFrame(records)
+        df["replicate"]=wildcards.rep
+        df.to_csv(output.csv, index=False)
+            
+
+rule count_clam_loci:
+    input:
+        loci="{rep}/clam/callable_sites.d4",
+    output:
+        tsv="{rep}/clam/prop_callable.tsv",
+    shell:
+        """
+        d4tools show {input.loci} | \
+        awk 'BEGIN {{ OFS="\\t" }} \
+             {{ print $1, $2, $3, ($4 + $5)/10 }}' \
+        > {output.tsv}
+        """
+
+rule count_callable_from_vcf:
+    input:
+        vcf="{rep}/calls/allsites.vcf.gz",
+        tbi="{rep}/calls/allsites.vcf.gz.tbi",
+    output:
+        tsv="{rep}/calls/allsites.prop_callable.tsv",
+    # conda:
+        # "envs/bcftools.yaml"
+    shell:
+        """
+        bcftools query -f '%CHROM\t%POS0\t%POS\t[%GT\t]\n' {input.vcf} | \
+        awk '{{ 
+            n = 0; total = 0;
+            for (i = 4; i <= NF; i++) {{
+                total++;
+                if ($i != "./." && $i != ".|.") n++;
+            }}
+            print $1, $2, $3, n / total;
+        }}' OFS="\t" > {output.tsv}
+        """
