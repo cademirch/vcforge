@@ -11,6 +11,7 @@ import pandas as pd
 import os
 import numpy as np
 import pyfastx
+import time
 from loguru import logger
 from snakemake_argparse_bridge import snakemake_compatible
 
@@ -34,9 +35,7 @@ def main():
     parser.add_argument(
         "--outdir", default="simulation_output", help="Output directory"
     )
-    parser.add_argument(
-        "--samples", default=5, dest="samples_per_pop"
-    )
+    parser.add_argument("--samples", default=5, dest="samples_per_pop", type=int)
     parser.add_argument(
         "--ref", dest="reference_fasta", help="path to ref fasta"
     )
@@ -52,22 +51,29 @@ def main():
     reference_seq = read_fasta(args.reference_fasta)
     logger.info(f"Read fasta: {args.reference_fasta}, found {len(reference_seq)}nt")
 
-    Ne1 = 1e6
+    Ne1 = 1720600
 
     total_samples = args.samples_per_pop * 2
-    logger.info("Simulating ancestry...")
 
+    logger.info(f"Simulating ancestry {total_samples=}")
+
+    start_time = time.time()
     ts = msprime.sim_ancestry(
         samples=total_samples,  # 20 haploid samples is s=5
         population_size=Ne1,
         sequence_length=len(reference_seq),
-        recombination_rate=contig.recombination_map.mean_rate,
+        recombination_rate=0,
         random_seed=args.seed,
     )
+    ancestry_time = time.time() - start_time
+    logger.info(f"Ancestry simulation completed in {ancestry_time:.2f} seconds")
 
     logger.info("Adding mutations...")
+    start_time = time.time()
     mutation_rate = species.genome.mean_mutation_rate
     ts = msprime.sim_mutations(ts, rate=mutation_rate, random_seed=args.seed)
+    mutation_time = time.time() - start_time
+    logger.info(f"Mutation simulation completed in {mutation_time:.2f} seconds")
 
     logger.info(f"Generated {ts.num_sites} variant sites")
     logger.info(f"Number of samples: {ts.num_samples}")
@@ -150,6 +156,7 @@ def main():
     logger.info(f"Saved population map: {os.path.join(args.outdir, 'popmap.txt')}")
 
     logger.info("Writing sample alignments...")
+    start_time = time.time()
     os.makedirs(os.path.join(args.outdir, "alignments"), exist_ok=True)
     alignments = list(ts.alignments(reference_sequence=reference_seq))
     logger.info(f"{len(alignments)=}")
@@ -178,6 +185,9 @@ def main():
             # Write haplotype 1
             f.write(f">{sample_name}_hap1\n")
             f.write(hap2 + "\n")
+
+    haplotype_time = time.time() - start_time
+    logger.info(f"Haplotype writing completed in {haplotype_time:.2f} seconds")
 
     tables = ts.dump_tables()
 
