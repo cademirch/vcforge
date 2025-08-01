@@ -1,7 +1,7 @@
 [workspace]
 authors = ["Cade Mirchandani <cmirchan@ucsc.edu>"]
 channels = ["conda-forge", "bioconda"]
-name = "simulations"
+name = "snpfactory"
 platforms = ["osx-arm64", "linux-64"]
 version = "0.1.0"
 
@@ -19,6 +19,7 @@ snakefmt = ">=0.11.0,<0.12"
 ipykernel = ">=6.29.5,<7"
 pip = ">=25.1.1,<26"
 vcftools = ">=0.1.17,<0.2"
+scikit-allel = ">=1.3.13,<2"
 
 [pypi-dependencies]
 tskit = ">=0.6.4, <0.7"
